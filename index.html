@@ -66,7 +66,7 @@
     font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.6px;
     margin:0 0 4px 2px;display:flex;align-items:center;gap:6px;
   }
-  .gname .pairBadge{
+  .pairBadge{
     font-size:10px;color:var(--s2);border:1px solid rgba(25,158,112,.45);
     padding:0 5px;border-radius:9px;text-transform:none;letter-spacing:0;
   }
@@ -109,6 +109,9 @@
   .tile .v small{font-size:12px;color:var(--ink-3);font-weight:500;margin-left:3px}
   .tile .l{font-size:11px;color:var(--ink-3);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}
   .tile.hl .v{color:var(--s1)}
+  .tile.mtile{padding:8px 9px 7px}
+  .tile.mtile .v{font-size:15px}
+  .tile.mtile .l{font-size:9.5px}
   /* ---------- panels grid ---------- */
   .grid{flex:1 1 auto;min-height:0;display:grid;gap:var(--pad)}
   #gridMap{grid-template-columns:11fr 9fr;grid-template-rows:1fr 1fr;grid-template-areas:"p3d p2d" "p3d phist"}
@@ -197,7 +200,7 @@
   <div class="logo">B₀</div>
   <div>
     <h1>Low-Field MRI Field Mapping</h1>
-    <div class="sub" id="subTitle">drop .xlsx field maps to begin</div>
+    <div class="sub" id="subTitle">drop .xlsx/.csv field maps to begin</div>
   </div>
   <div class="spacer"></div>
   <div class="seg" id="unitSeg">
@@ -210,6 +213,7 @@
     <button data-tab="map" class="on">Field map</button>
     <button data-tab="stats">Statistics</button>
     <button data-tab="cmp">Scan–Rescan</button>
+    <button data-tab="multi">Multi-View</button>
   </div>
 </header>
 
@@ -217,10 +221,11 @@
   <aside id="sidebar">
     <h3>Datasets</h3>
     <div id="drop">
-      <div><b>Drop .xlsx files</b> here<br>or click to browse</div>
+      <div><b>Drop .xlsx or .csv files</b> here<br>or click to browse</div>
       <div style="margin-top:6px;font-size:10.5px">name as <span style="color:var(--ink-2)">SCANNER_DSV60_RES8_S01.xlsx</span><br>for automatic grouping &amp; rescan pairing</div>
+      <div style="margin-top:6px;font-size:10.5px">required columns: <span style="color:var(--ink-2)">x, y, z (mm)</span> and a field column in Tesla — also accepted: <span style="color:var(--ink-2)">reading, B0, field, |B|, Bz</span>. Values in Gauss or mT are auto-converted (with an on-screen note).</div>
     </div>
-    <input type="file" id="fileInput" accept=".xlsx,.xls" multiple style="display:none">
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" multiple style="display:none">
     <button id="demoBtn">⚡ Load all sample data</button>
     <div id="dsList"><div class="empty">No datasets loaded yet</div></div>
 
@@ -300,7 +305,7 @@
         <div class="ic">🧲</div>
         <div><b>No field map loaded</b><br>
         Drop one or more <code>.xlsx</code> robot field maps on the left panel.<br>
-        Expected columns: <code>x</code>, <code>y</code>, <code>z</code> (mm) and <code>B</code> (T).</div>
+        Expected columns: <code>x</code>, <code>y</code>, <code>z</code> (mm) and a field column in Tesla — also accepted: <code>reading</code>, <code>B0</code>, <code>field</code>, <code>|B|</code>, <code>Bz</code>. Values in Gauss/mT are converted automatically.</div>
       </div>
     </div>
 
@@ -362,6 +367,23 @@
         </div>
       </div>
     </div>
+
+    <!-- ============ MULTI-VIEW TAB ============ -->
+    <div class="tabpane" id="tabMulti">
+      <div class="panel" style="flex:0 0 auto;">
+        <div class="tblbar">
+          <span class="ttl">Select field maps to compare</span>
+          <span class="spacer" style="flex:1"></span>
+          <button id="multiPlotBtn">▶ Plot</button>
+        </div>
+        <div id="multiCheckList" style="display:flex;flex-wrap:wrap;gap:6px 22px;padding:0 12px 12px;"></div>
+      </div>
+      <div id="multiGrid" style="flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:var(--pad);"></div>
+      <div id="multiEmpty" class="empty" style="display:none;padding:30px;">Selecciona uno o más field maps arriba y presiona Plot.</div>
+      <div style="flex:0 0 auto;padding:6px 4px 0;font-size:11px;color:var(--ink-3);">
+        Based on the Field Map Dashboard by Hugo Plante — github.com/haplante/low_feild_mri_mapping. Multi-View extension added by the Chile team.
+      </div>
+    </div>
   </main>
 </div>
 
@@ -409,12 +431,52 @@ const state = {
   tab:"map",
   sliceAxis:"z", sliceIdx:1e9,          // 1e9 -> clamps to the centre slice
   cmpA:null, cmpB:null, cmpSliceIdx:1e9,
+  multiSel:new Set(),      // dataset ids currently checked in the Multi-View tab
   _uid:0
 };
 const $ = id=>document.getElementById(id);
 
 /* ================= parsing ================= */
 const NAME_RE = /^(.+?)[_-]DSV(\d+(?:\.\d+)?)[_-]RES(\d+(?:\.\d+)?)[_-]S(\d+)/i;
+
+// Column names accepted as the field-magnitude column, besides plain "B".
+// Different robots/probes label this differently (Alphalab/Metrolab exports
+// often use "reading"); we recognise the common variants instead of forcing
+// every site to rename their export by hand.
+const B_ALIASES = ["b","|b|","bz","b (t)","b0","field","reading","b (gauss)","b0 (gauss)"];
+
+// Some probes report in Gauss or milliTesla instead of Tesla. Low-field MRI
+// magnets in this course never exceed ~1 T, so if the raw column's average
+// magnitude is outside a plausible Tesla range we try the two next most
+// common scalings and keep whichever lands in range. This never guesses
+// silently: the caller gets back a human-readable note describing exactly
+// what was assumed, so it can be shown on screen for the user to verify.
+function autoScaleB(raw){
+  if(!raw.length) return {B:raw, note:null};
+  const meanAbs = raw.reduce((a,b)=>a+Math.abs(b),0)/raw.length;
+  // Plausible range for a *low-field* MRI magnet (this course): every site so far
+  // falls well under 0.3 T. Keeping the window this tight is what lets us tell
+  // Gauss (÷1e4) and milliTesla (÷1e3) apart — a wider "≤2 T" window is ambiguous,
+  // since e.g. 517 could look like valid milliTesla (0.517 T) even when it's
+  // really Gauss (0.0517 T). If your site's magnet is unusually strong and this
+  // rejects genuinely-correct Tesla values, widen LO/HI below.
+  const LO=1e-4, HI=0.3;
+  if(meanAbs>0 && meanAbs<=HI) return {B:raw, note:null};   // already plausible as Tesla
+  const REF=0.06;   // typical field seen across this course's example maps, for tie-breaking
+  const candidates=[{div:1e3,label:"milliTesla (mT)"},{div:1e4,label:"Gauss"}];
+  const fits=candidates
+    .map(c=>({...c, scaled:meanAbs/c.div}))
+    .filter(c=>c.scaled>LO && c.scaled<=HI);
+  if(fits.length){
+    fits.sort((a,b)=>Math.abs(a.scaled-REF)-Math.abs(b.scaled-REF));  // closest-to-typical wins if more than one fits
+    const c=fits[0];
+    return {
+      B: raw.map(v=>v/c.div),
+      note:`Los valores originales parecían estar en ${c.label}, no en Tesla — se convirtieron dividiendo entre ${c.div.toLocaleString()}. Verifica que sea correcto.`
+    };
+  }
+  return {B:raw, note:"Los valores no parecen estar en Tesla y no se pudo adivinar la unidad — revísalos manualmente."};
+}
 
 function parseWorkbook(name, wb){
   const ws = wb.Sheets[wb.SheetNames[0]];
@@ -428,42 +490,44 @@ function parseWorkbook(name, wb){
     if(ix>=0 && iy>=0 && iz>=0){
       hi=r; cx=ix; cy=iy; cz=iz;
       cb = low.indexOf("b");
-      if(cb<0) cb = low.findIndex(v=>v==="|b|"||v==="bz"||v==="b (t)"||v==="b0"||v==="field");
+      if(cb<0) cb = low.findIndex(v=>B_ALIASES.includes(v));
       ct = low.findIndex(v=>v.includes("time"));
       break;
     }
   }
   if(hi<0) throw new Error("no x/y/z header row found");
-  if(cb<0) throw new Error("no B column found");
+  if(cb<0) throw new Error("no B/field column found (se buscaron: "+B_ALIASES.join(", ")+")");
   // strict numeric coercion: null/undefined/""/whitespace/labels -> NaN
   // (blank cells come back as null OR "" depending on the writing library)
   const num=v=>(v===null||v===undefined||(typeof v==="string"&&v.trim()===""))?NaN:Number(v);
-  const pts={x:[],y:[],z:[],B:[],t:[]};   // row order = robot acquisition order
+  const xs=[],ys=[],zs=[],rawB=[],ts=[];   // row order = robot acquisition order
   for(let r=hi+1; r<rows.length; r++){
     const row=rows[r];
-    const x=num(row[cx]), y=num(row[cy]), z=num(row[cz]), B=num(row[cb]);
-    if([x,y,z,B].every(Number.isFinite)){
+    const x=num(row[cx]), y=num(row[cy]), z=num(row[cz]), b=num(row[cb]);
+    if([x,y,z,b].every(Number.isFinite)){
       // footer rows ("maximum", "ppm", "2.13 MHz"...) fail the numeric test and are skipped
-      pts.x.push(x); pts.y.push(y); pts.z.push(z); pts.B.push(B);
-      pts.t.push(ct>=0 && row[ct]!=null ? String(row[ct]) : "");
+      xs.push(x); ys.push(y); zs.push(z); rawB.push(b);
+      ts.push(ct>=0 && row[ct]!=null ? String(row[ct]) : "");
     }
   }
-  if(pts.B.length<4) throw new Error("fewer than 4 valid measurement rows");
-  return pts;
+  if(rawB.length<4) throw new Error("fewer than 4 valid measurement rows");
+  const {B, note} = autoScaleB(rawB);
+  return {x:xs, y:ys, z:zs, B, t:ts, unitNote:note};
 }
 
 function addDataset(name, wb){
   const pts = parseWorkbook(name, wb);
-  const m = name.replace(/\.(xlsx|xls)$/i,"").match(NAME_RE);
+  const m = name.replace(/\.(xlsx|xls|csv)$/i,"").match(NAME_RE);
   const rmax = Math.max(...pts.x.map((_,i)=>Math.hypot(pts.x[i],pts.y[i],pts.z[i])));
   const ds = {
     id:"ds"+(++state._uid),
     file:name,
-    scanner: m? m[1].toUpperCase() : name.replace(/\.(xlsx|xls)$/i,""),
+    scanner: m? m[1].toUpperCase() : name.replace(/\.(xlsx|xls|csv)$/i,""),
     dsv: m? +m[2] : Math.round(2*rmax),
     res: m? +m[3] : estimateRes(pts),
     scan: m? +m[4] : 1,
     named: !!m,
+    unitNote: pts.unitNote || null,
     pts
   };
   ds.stats = computeStats(pts.B);
@@ -1121,6 +1185,129 @@ function renderCmpHist(A,B,meanPool){
   }), PLOT_CFG);
 }
 
+/* ================= Multi-View tab =================
+   Reuses: state.datasets (already parsed & stats'd by addDataset/computeStats),
+   conv()/convArr()/UNIT_LBL (unit conversion), colorRange(), cscale(), sphereTraces(),
+   baseLayout(), fmt() — nothing here re-implements parsing or statistics. */
+function renderMultiControls(){
+  const el=$("multiCheckList");
+  if(!state.datasets.length){ el.innerHTML='<div class="empty">No datasets loaded yet</div>'; return; }
+  el.innerHTML = state.datasets.map(d=>`
+    <label class="chk">
+      <input type="checkbox" class="multiChk" data-id="${d.id}" ${state.multiSel.has(d.id)?"checked":""}>
+      ${d.name} <span style="color:var(--ink-3)">· ${d.file}</span>
+    </label>`).join("");
+  el.querySelectorAll(".multiChk").forEach(cb=>{
+    cb.onchange=()=>{
+      if(cb.checked) state.multiSel.add(cb.dataset.id);
+      else state.multiSel.delete(cb.dataset.id);
+    };
+  });
+}
+function multiTile(v,u,l){
+  return `<div class="tile mtile"><div class="v">${v}<small>${u}</small></div><div class="l">${l}</div></div>`;
+}
+function renderMultiPanel(ds){
+  const s=ds.stats, plotId="mplot_"+ds.id;
+  return `<div class="panel" style="flex:0 0 380px;">
+    <div class="phead">${ds.name}<span class="spacer"></span><span class="slicelbl">${ds.file}</span></div>
+    ${ds.unitNote?`<div class="slicelbl" style="color:#c98500;padding:6px 12px 0;">Nota: ${ds.unitNote}</div>`:""}
+    <div style="flex:1 1 auto;min-height:0;display:flex;gap:var(--pad);padding:10px;">
+      <div class="plot" id="${plotId}" style="flex:1 1 60%;"></div>
+      <div style="flex:0 0 220px;display:grid;grid-template-columns:1fr 1fr;gap:8px;align-content:start;">
+        ${multiTile(fmt(s.mean*1e3,3),"mT","Mean B₀")}
+        ${multiTile(fmt(s.larmor,4),"MHz","Larmor ¹H")}
+        ${multiTile(fmt(s.ppmPP,0),"ppm","Inhomog. p–p")}
+        ${multiTile(fmt(s.ppmRMS,0),"ppm","Inhomog. RMS")}
+        ${multiTile(`${s.n}`,"pts","N points")}
+        ${multiTile(`${ds.dsv}`,"mm","DSV")}
+      </div>
+    </div>
+  </div>`;
+}
+function renderMultiSummary(chosen){
+  if(chosen.length<2) return "";   // only useful once you're actually comparing something
+  const best = chosen.reduce((b,d)=> d.stats.ppmPP<b.stats.ppmPP? d : b, chosen[0]);
+  const rows = chosen.map(d=>{
+    const tag = d.id===best.id ? ` <span class="pairBadge">mejor homogeneidad</span>` : "";
+    return `<tr><td class="nm">${d.name}${tag}</td>
+      <td>${fmt(d.stats.mean*1e3,3)}</td>
+      <td>${fmt(d.stats.larmor,4)}</td>
+      <td>${fmt(d.stats.ppmPP,0)}</td>
+      <td>${fmt(d.stats.ppmRMS,0)}</td>
+      <td>${d.dsv}</td>
+      <td>${d.stats.n}</td></tr>`;
+  }).join("");
+  return `<div class="panel" style="flex:0 0 auto;">
+    <div class="phead">Resumen comparativo</div>
+    <div style="overflow:auto;padding:2px 4px 12px;">
+      <table class="stats" style="width:100%;">
+        <thead><tr><th>Dataset</th><th>Mean B0 (mT)</th><th>Larmor (MHz)</th>
+        <th>ppm p-p</th><th>ppm RMS</th><th>DSV (mm)</th><th>N</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+function renderMulti3d(ds, elId){
+  const el=$(elId);
+  const disp=convArr(ds.pts.B, ds.stats.mean);
+  const [cmin,cmax]=colorRange(disp);
+  const cbar={title:{text:UNIT_LBL[state.unit],side:"right"}, thickness:10, len:.75,
+              tickfont:{color:C.ink3,size:9}, outlinewidth:0};
+  const traces=[{
+    type:"scatter3d", mode:"markers",
+    x:ds.pts.x, y:ds.pts.y, z:ds.pts.z,
+    marker:{size:+$("optMarker").value, color:disp, colorscale:cscale(), cmin, cmax,
+            colorbar:cbar, opacity:.9, line:{width:0}},
+    customdata:disp,
+    hovertemplate:"x %{x} · y %{y} · z %{z} mm<br>B = %{customdata:.4f} "+UNIT_LBL[state.unit]+"<extra></extra>"
+  }];
+  // same trajectory / DSV sphere / slice-plane overlays as the single-dataset Field map tab,
+  // driven by the SAME "Display options" sidebar controls so both tabs stay in sync
+  if($("optTraj").checked){
+    const n=ds.pts.B.length, order=ds.pts.B.map((_,i)=>i+1);
+    traces.push({
+      type:"scatter3d", mode:"lines",
+      x:ds.pts.x, y:ds.pts.y, z:ds.pts.z,
+      line:{color:"rgba(195,194,183,0.45)", width:2},
+      customdata:order, text:ds.pts.t,
+      hovertemplate:"point %{customdata}/"+n+"<br>%{text}<br>x %{x} · y %{y} · z %{z} mm<extra>path</extra>"
+    });
+    traces.push({
+      type:"scatter3d", mode:"markers+text",
+      x:[ds.pts.x[0],ds.pts.x[n-1]], y:[ds.pts.y[0],ds.pts.y[n-1]], z:[ds.pts.z[0],ds.pts.z[n-1]],
+      text:["start","end"], textposition:"top center",
+      textfont:{color:C.ink2, size:11},
+      marker:{size:6, color:[C.s2,C.s6], line:{width:1,color:"rgba(255,255,255,.6)"}},
+      hoverinfo:"skip"
+    });
+  }
+  if($("optSphere").checked) traces.push(...sphereTraces(ds.dsv/2));
+  if($("optSlice3d").checked){
+    const g=slicePlaneGeo(ds);
+    traces.push(g.plane, g.ring);
+  }
+  const ax={gridcolor:C.grid, zerolinecolor:C.baseline, color:C.ink3,
+            backgroundcolor:C.surface, showbackground:true, title:{font:{size:10}}};
+  Plotly.react(el, traces, baseLayout({
+    margin:{l:0,r:0,t:0,b:0},
+    scene:{ xaxis:Object.assign({title:{text:"x (mm)"}},ax),
+            yaxis:Object.assign({title:{text:"y (mm)"}},ax),
+            zaxis:Object.assign({title:{text:"z (mm)"}},ax),
+            aspectmode:"data", camera:{eye:{x:1.5,y:-1.5,z:0.9}} }
+  }), PLOT_CFG);
+}
+function plotMultiView(){
+  const grid=$("multiGrid"), empty=$("multiEmpty");
+  const chosen=state.datasets.filter(d=>state.multiSel.has(d.id));
+  if(!chosen.length){ grid.innerHTML=""; empty.style.display="flex"; return; }
+  empty.style.display="none";
+  grid.innerHTML = renderMultiSummary(chosen) + chosen.map(renderMultiPanel).join("");
+  chosen.forEach(ds=>renderMulti3d(ds,"mplot_"+ds.id));
+}
+$("multiPlotBtn").onclick=plotMultiView;
+
 /* ================= sidebar dataset list ================= */
 function renderList(){
   const el=$("dsList");
@@ -1140,7 +1327,8 @@ function renderList(){
       html+=`<div class="dsItem ${d.id===state.activeId?"active":""}" data-id="${d.id}">
         <span class="dot"></span>
         <span class="nm"><span class="t">S${String(d.scan).padStart(2,"0")} · DSV ${d.dsv} · ${d.res} mm</span>
-        <span class="d">${d.stats.n} pts · ${fmt(d.stats.mean*1e3,2)} mT · ${fmt(d.stats.ppmPP,0)} ppm</span></span>
+        <span class="d">${d.stats.n} pts · ${fmt(d.stats.mean*1e3,2)} mT · ${fmt(d.stats.ppmPP,0)} ppm</span>
+        ${d.unitNote?`<span class="d" style="color:#c98500">Nota: ${d.unitNote}</span>`:""}</span>
         <button class="rm" title="remove">×</button></div>`;
     }
     html+="</div>";
@@ -1166,7 +1354,7 @@ function refreshAll(){
   const ds=active();
   $("subTitle").textContent = ds
     ? `${state.datasets.length} dataset${state.datasets.length>1?"s":""} loaded — viewing ${ds.file}`
-    : "drop .xlsx field maps to begin";
+    : "drop .xlsx/.csv field maps to begin";
   renderList();
   $("gridMap").style.display = ds? "grid":"none";
   $("tiles").style.display = ds? "grid":"none";
@@ -1174,6 +1362,16 @@ function refreshAll(){
   if(state.tab==="map" && ds){ renderTiles(ds); render3d(ds); render2d(ds); renderHist(ds); }
   if(state.tab==="stats"){ renderStatTable(); renderHom(); renderBox(); }
   if(state.tab==="cmp"){ fillCmpSelectors(); renderCompare(); }
+  if(state.tab==="multi"){ renderMultiControls(); plotMultiView(); }
+  // "3D rendering" mode, "2D slice rendering", "Overlay measured points on 2D map", "Gaussian
+  // fit overlay" and "Show mapping trajectory (2D slice)" only affect the single-dataset Field
+  // map tab (Multi-View always shows a compact point-cloud per panel, no 2D slice/histogram) —
+  // grey them out on Multi-View instead of leaving them silently inert
+  const multiOnly = state.tab==="multi";
+  ["opt3d","opt2d"].forEach(id=>{ const el=$(id); el.disabled=multiOnly; el.closest(".opt").style.opacity = multiOnly? .4 : 1; });
+  ["optTraj2d","optGauss","optPts2d"].forEach(id=>{
+    const cb=$(id); cb.disabled=multiOnly; cb.closest("label").style.opacity = multiOnly? .4 : 1;
+  });
 }
 
 /* ================= events ================= */
@@ -1183,6 +1381,7 @@ function setTab(tab){
   $("tabMap").classList.toggle("on",tab==="map");
   $("tabStats").classList.toggle("on",tab==="stats");
   $("tabCmp").classList.toggle("on",tab==="cmp");
+  $("tabMulti").classList.toggle("on",tab==="multi");
   refreshAll();
 }
 $("tabSeg").addEventListener("click",e=>{
@@ -1216,7 +1415,7 @@ $("fileInput").onchange=e=>{loadFiles([...e.target.files]); e.target.value="";};
 async function loadFiles(files){
   const errs=[];
   for(const f of files){
-    if(!/\.(xlsx|xls)$/i.test(f.name)) continue;
+    if(!/\.(xlsx|xls|csv)$/i.test(f.name)) continue;
     try{
       const buf=await f.arrayBuffer();
       addDataset(f.name, XLSX.read(buf,{type:"array"}));
@@ -1260,10 +1459,10 @@ $("plotDiff").addEventListener("wheel",e=>{
 },{passive:false});
 ["optCscale","opt3d","opt2d"].forEach(id=>$(id).onchange=()=>refreshAll());
 $("optClip").oninput=e=>{$("clipVal").textContent=`${e.target.value}–${100-e.target.value} %`; refreshAll();};
-$("optMarker").oninput=e=>{$("mkVal").textContent=e.target.value; render3d(active());};
-$("optSphere").onchange=()=>render3d(active());
-$("optSlice3d").onchange=()=>render3d(active());
-$("optTraj").onchange=()=>render3d(active());
+$("optMarker").oninput=e=>{$("mkVal").textContent=e.target.value; state.tab==="multi"?plotMultiView():render3d(active());};
+$("optSphere").onchange=()=>{state.tab==="multi"?plotMultiView():render3d(active());};
+$("optSlice3d").onchange=()=>{state.tab==="multi"?plotMultiView():render3d(active());};
+$("optTraj").onchange=()=>{state.tab==="multi"?plotMultiView():render3d(active());};
 $("optTraj2d").onchange=()=>render2d(active());
 $("optGauss").onchange=()=>renderHist(active());
 $("optPts2d").onchange=()=>render2d(active());
